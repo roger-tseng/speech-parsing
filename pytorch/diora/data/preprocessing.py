@@ -29,7 +29,7 @@ def indexify(sentences, word2idx, unk_index=None):
             if w not in word2idx and unk_index is None:
                 raise ValueError
             yield word2idx.get(w, unk_index)
-    return [list(fn(s)) for s in tqdm(sentences, desc='indexify')]
+    return [list(fn(s)) for s in sentences]
 
 
 def batchify(examples, batch_size):

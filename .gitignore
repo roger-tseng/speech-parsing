@@ -6,6 +6,6 @@
 
 # diora
 cache
-data
+/data
 diora-checkpoints
 log

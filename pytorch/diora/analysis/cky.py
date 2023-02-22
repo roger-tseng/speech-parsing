@@ -6,11 +6,9 @@ from diora.logging.configuration import get_logger
 
 
 class ParsePredictor(object):
-    def __init__(self, net, word2idx):
+    def __init__(self, net):
         super(ParsePredictor, self).__init__()
         self.net = net
-        self.word2idx = word2idx
-        self.idx2word = {v: k for k, v in word2idx.items()}
         self.logger = get_logger()
 
     def parse_batch(self, batch_map):

@@ -132,9 +132,56 @@ class ReconstructionSoftmaxLoss(nn.Module):
 
         return loss, ret
 
+class SpeechReconstructionSoftmaxLoss(ReconstructionSoftmaxLoss):
+    name = 'speech_reconstruct_softmax_loss'
+
+    def forward(self, batch, neg_samples, diora, info):
+        input_size = self.input_size
+        size = diora.outside_h.shape[-1]
+        k = self.k_neg
+
+        # (B, L, H), batch size x word count x emb dims
+        emb_pos = self.embeddings(batch)
+        batch_size, length, dims = emb_pos.shape
+        emb_neg = self.embeddings(neg_samples)
+        # Soft negative sampling: 
+        # Completely shuffle words in current batch to form negative samples
+        # emb_neg = torch.stack([emb_pos.flatten()[torch.randperm(batch_size*length*dims)] for i in range(k)]).view(1, -1, dims)
+
+        # Calculate scores.
+
+        ## The predicted vector.
+        cell = diora.outside_h[:, :length].view(batch_size, length, 1, -1)
+
+        ## The projected samples.
+        proj_pos = torch.matmul(emb_pos, torch.t(self.mat))
+        proj_neg = torch.matmul(emb_neg, torch.t(self.mat))
+
+        ## The score.
+        xp = torch.einsum('abc,abxc->abx', proj_pos, cell)
+        xn = torch.einsum('ezc,abxc->abe', proj_neg, cell)
+
+        score = torch.cat([xp, xn], 2)
+
+        # Calculate loss.
+        lossfn = nn.CrossEntropyLoss()
+        inputs = score.view(batch_size * length, k + 1)
+        device = torch.cuda.current_device() if self._cuda else None
+        outputs = torch.full((inputs.shape[0],), 0, dtype=torch.int64, device=device)
+
+        self.loss_hook(batch, neg_samples, inputs)
+
+        loss = lossfn(inputs, outputs)
+
+        ret = dict(speech_reconstruction_softmax_loss=loss)
+
+        return loss, ret
 
 def get_loss_funcs(options, batch_iterator=None, embedding_layer=None):
-    input_dim = embedding_layer.weight.shape[1]
+    if options.modality == 'speech':
+        input_dim = options.emb_dim
+    else:
+        input_dim = embedding_layer.weight.shape[1]
     size = options.hidden_dim
     k_neg = options.k_neg
     margin = options.margin
@@ -147,12 +194,54 @@ def get_loss_funcs(options, batch_iterator=None, embedding_layer=None):
         reconstruction_loss_fn = ReconstructionLoss(embedding_layer,
             margin=margin, k_neg=k_neg, input_size=input_dim, size=size, cuda=cuda)
     elif options.reconstruct_mode == 'softmax':
-        reconstruction_loss_fn = ReconstructionSoftmaxLoss(embedding_layer,
-            margin=margin, k_neg=k_neg, input_size=input_dim, size=size, cuda=cuda)
+        if options.modality == 'speech':
+            reconstruction_loss_fn = SpeechReconstructionSoftmaxLoss(embedding_layer,
+                margin=margin, k_neg=k_neg, input_size=input_dim, size=size, cuda=cuda)
+        else:
+            reconstruction_loss_fn = ReconstructionSoftmaxLoss(embedding_layer,
+                margin=margin, k_neg=k_neg, input_size=input_dim, size=size, cuda=cuda)
     loss_funcs.append(reconstruction_loss_fn)
 
     return loss_funcs
 
+class Pooling(nn.Module):
+    def __init__(self, input_size):
+        super(Pooling, self).__init__()
+
+        self.feature_transform = nn.Sequential(
+                                    nn.Linear(input_size, input_size),
+                                    nn.ReLU(),
+                                    nn.Linear(input_size, 1),
+        )
+        self.softmax = nn.functional.softmax
+
+    def forward(self, batch):
+        """
+        input batch is a tuple (batch_rep, att_mask)
+        batch_rep: size (B, T, H) or (T, H),   B: batch size, T: sequence length, H: Hidden dimension
+        att_mask:  size (B, N, T),                Attention Mask logits
+        
+        attention_weight:
+        att_w : size (B, N, T, 1)
+        
+        return:
+        utter_rep: size (B, N, H)
+        """
+        # (B, T, H), (B, N, T)
+        batch_rep, att_mask = batch
+        # (B, T)
+        att_logits = self.feature_transform(batch_rep).squeeze(-1)
+        # (B, N, T)
+        att_logits = att_mask + att_logits.unsqueeze(1) # masked out frames recieves ~0% prob.
+        # compute attention att_w
+        # softmax over segment dimension i.e. take the most representation frame to represent word
+        # (B, N, T) 
+        att_w = self.softmax(att_logits, dim=-1)
+        # apply att_w to input
+        # (B, N, H) = (B, T, H) * (B, T, 1)
+        segment_rep = torch.matmul(att_w, batch_rep)
+
+        return segment_rep
 
 class Embed(nn.Module):
     def __init__(self, embeddings, input_size, size):
@@ -168,12 +257,20 @@ class Embed(nn.Module):
         for i, param in enumerate(params):
             param.data.normal_()
 
-    def forward(self, x):
+    def forward(self, batch):
+        x = batch['sentences']
         batch_size, length = x.shape
         e = self.embeddings(x.view(-1))
         t = torch.mm(e, self.mat.t()).view(batch_size, length, -1)
         return t
 
+class SpeechEmbed(Embed):
+    def forward(self, batch):
+        x = (batch['upstream_embeddings'], batch['word_masks'])
+        e = self.embeddings(x)
+        batch_size, length, _ = e.shape
+        t = torch.mm(e.view(batch_size*length, -1), self.mat.t()).view(batch_size, length, -1)
+        return t
 
 class Net(nn.Module):
     def __init__(self, embed, diora, loss_funcs=[]):
@@ -211,11 +308,17 @@ class Net(nn.Module):
         return ret, loss
 
     def forward(self, batch, neg_samples=None, compute_loss=True, info=None):
-        # Embed
+        # Note that batch is a tuple of two Tensors for speech, and a Tensor for text
+        # Embed (B x word count x emb size)
         embed = self.embed(batch)
 
         # Run DIORA
         self.diora(embed)
+
+        if 'upstream_embeddings' in batch: # modality == 'speech'
+            batch = (batch['upstream_embeddings'], batch['word_masks'])
+        else:
+            batch = batch['sentences']
 
         # Compute Loss
         if compute_loss:
@@ -271,24 +374,25 @@ class Trainer(object):
             return net.module
         return net
 
-    def save_model(self, model_file):
+    def save_model(self, model_file, save_emb):
         state_dict = self.net.state_dict()
 
-        todelete = []
+        if not save_emb:
+            todelete = []
 
-        for k in state_dict.keys():
-            if 'embeddings' in k:
-                todelete.append(k)
+            for k in state_dict.keys():
+                if 'embeddings' in k:
+                    todelete.append(k)
 
-        for k in todelete:
-            del state_dict[k]
+            for k in todelete:
+                del state_dict[k]
 
         torch.save({
             'state_dict': state_dict,
         }, model_file)
 
     @staticmethod
-    def load_model(net, model_file):
+    def load_model(net, model_file, load_emb):
         save_dict = torch.load(model_file, map_location=lambda storage, loc: storage)
         state_dict_toload = save_dict['state_dict']
         state_dict_net = Trainer.get_single_net(net).state_dict()
@@ -311,15 +415,14 @@ class Trainer(object):
 
         # Hack to support embeddings.
         for k in state_dict_net.keys():
-            if 'embeddings' in k:
+            if not load_emb and 'embeddings' in k:
                 state_dict_toload[k] = state_dict_net[k]
 
         Trainer.get_single_net(net).load_state_dict(state_dict_toload)
 
-    def run_net(self, batch_map, compute_loss=True, multigpu=False):
-        batch = batch_map['sentences']
-        neg_samples = batch_map.get('neg_samples', None)
-        info = self.prepare_info(batch_map)
+    def run_net(self, batch, compute_loss=True, multigpu=False):
+        neg_samples = batch.get('neg_samples', None)
+        info = self.prepare_info(batch)
         out = self.net(batch, neg_samples=neg_samples, compute_loss=compute_loss, info=info)
         return out
 
@@ -386,7 +489,6 @@ def build_net(options, embeddings=None, batch_iterator=None, random_seed=None):
     k_neg = options.k_neg
     margin = options.margin
     normalize = options.normalize
-    input_dim = embeddings.shape[1]
     cuda = options.cuda
     rank = options.local_rank
     ngpus = 1
@@ -398,8 +500,19 @@ def build_net(options, embeddings=None, batch_iterator=None, random_seed=None):
         torch.distributed.init_process_group(backend='nccl', init_method='env://')
 
     # Embed
-    embedding_layer = nn.Embedding.from_pretrained(torch.from_numpy(embeddings), freeze=True)
-    embed = Embed(embedding_layer, input_size=input_dim, size=size)
+    if options.modality == 'speech':
+        input_dim = options.emb_dim
+        # takes SSL embeddings and word masks as input
+        embedding_layer = Pooling(input_size=input_dim)
+        # takes word embeddings from layer as input
+        embed = SpeechEmbed(embedding_layer, input_size=input_dim, size=size)#layer=options.upstream_layer,)
+    else:
+        # takes word IDs of sentences as input
+        if options.emb == 'none':
+            embedding_layer = embeddings
+        else:
+            embedding_layer = nn.Embedding.from_pretrained(torch.from_numpy(embeddings), freeze=True)
+        embed = Embed(embedding_layer, input_size=embedding_layer.weight.size(1), size=size)
 
     # Diora
     if options.arch == 'treelstm':
@@ -418,7 +531,7 @@ def build_net(options, embeddings=None, batch_iterator=None, random_seed=None):
     # Load model.
     if options.load_model_path is not None:
         logger.info('Loading model: {}'.format(options.load_model_path))
-        Trainer.load_model(net, options.load_model_path)
+        Trainer.load_model(net, options.load_model_path, load_emb=(options.emb == 'none'))
 
     # CUDA-support
     if cuda:
@@ -426,6 +539,8 @@ def build_net(options, embeddings=None, batch_iterator=None, random_seed=None):
             torch.cuda.set_device(options.local_rank)
         net.cuda()
         diora.cuda()
+        if options.modality == 'speech':
+            embed.cuda()
 
     if cuda and options.multigpu:
         net = torch.nn.parallel.DistributedDataParallel(

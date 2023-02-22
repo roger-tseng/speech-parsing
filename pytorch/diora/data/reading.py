@@ -111,10 +111,11 @@ def get_spans(tree):
 
 
 class BaseTextReader(object):
-    def __init__(self, lowercase=True, filter_length=0, include_id=False):
+    def __init__(self, lowercase=True, filter_length=0, include_id=False, include_dict=None):
         self.lowercase = lowercase
         self.filter_length = filter_length if filter_length is not None else 0
         self.include_id = include_id
+        self.include_dict = include_dict
 
     def read(self, filename):
         return self.read_sentences(filename)
@@ -122,6 +123,9 @@ class BaseTextReader(object):
     def read_sentences(self, filename):
         sentences = []
         extra = collections.defaultdict(list)
+        word2idx = None
+        if self.include_dict is not None:
+            word2idx = json.load(open(self.include_dict, 'r'))
 
         example_ids = []
 
@@ -141,15 +145,21 @@ class BaseTextReader(object):
                         example_id = len(sentences)
                     if self.lowercase:
                         s = [w.lower() for w in s]
+                    if word2idx is not None:
+                        s = [w if w in word2idx else '<unk>' for w in s]
 
                     sentences.append(s)
                     extra['example_ids'].append(example_id)
                     extra['file_order'].append(len(extra['file_order'])) # Preserves ordering that sentences were read in.
                     # extra['original_input'].append(line)
 
+        metadata = {}
+        metadata['word2idx'] = word2idx
+
         return {
             "sentences": sentences,
-            "extra": extra
+            "extra": extra,
+            "metadata": metadata
             }
 
     def read_line(self, line):
@@ -157,14 +167,14 @@ class BaseTextReader(object):
 
 
 class PlainTextReader(BaseTextReader):
-    def __init__(self, lowercase=True, filter_length=0, delim=' ', include_id=False):
-        super(PlainTextReader, self).__init__(lowercase=lowercase, filter_length=filter_length, include_id=include_id)
+    def __init__(self, lowercase=True, filter_length=0, delim=' ', include_id=False, include_dict=None):
+        super(PlainTextReader, self).__init__(lowercase=lowercase, filter_length=filter_length, include_id=include_id, include_dict=include_dict)
         self.delim = delim
 
     def read_line(self, line):
         s = line.strip().split(self.delim)
-        if self.lowercase:
-            s = [w.lower() for w in s]
+        # if self.lowercase:
+        #     s = [w.lower() for w in s]
         yield s
 
 
@@ -252,7 +262,7 @@ class NLIReader(object):
         s2, t2 = convert_binary_bracketing(example['sentence2_binary_parse'], lowercase=self.lowercase)
         example_id = example['pairID']
 
-        return dict(s1=s1, label=label, s2=s2, t1=t1, t2=t2, example_id=example_id)
+        return dict(s1=s1, label=label, s2=s2, t1=t1, t2=t2, example_id=example_id) # two sentences and corresponding parse transitions per line
 
     def read_label(self, label):
         return self.LABEL_MAP[label]
@@ -261,7 +271,7 @@ class NLIReader(object):
 class NLISentenceReader(NLIReader):
     def read_sentences(self, filename):
         sentences = []
-        extra = {}
+        extra = collections.defaultdict(list)
         example_ids = []
 
         with open(filename) as f:
@@ -277,9 +287,11 @@ class NLISentenceReader(NLIReader):
 
                 if not skip_s1:
                     example_ids.append(example_id + '_1')
+                    extra['file_order'].append(len(extra['file_order'])) # Preserves ordering that sentences were read in.
                     sentences.append(s1)
                 if not skip_s2:
                     example_ids.append(example_id + '_2')
+                    extra['file_order'].append(len(extra['file_order']))
                     sentences.append(s2)
 
         extra['example_ids'] = example_ids
@@ -355,3 +367,115 @@ class SyntheticReader(object):
             "metadata": metadata
             }
 
+class COCOReader(object):
+    '''
+    from https://github.com/bobwan1995/cliora/blob/master/cliora/data/reading.py
+    '''
+    def __init__(self, lowercase=True, filter_length=0, delim=' '):
+        self.delim = delim
+        self.lowercase = lowercase
+        self.filter_length = filter_length if filter_length is not None else 0
+
+    def read(self, filename):
+        sentences = []
+        extra = collections.defaultdict(list)
+
+        example_ids = []
+        gts = []
+        vis_feats = []
+        # word2idx = None
+        # if os.path.exists(filename.replace(filename.split('/')[-1], 'coco.dict.json')):
+        #     word2idx = json.load(open(filename.replace(filename.split('/')[-1], 'coco.dict.json'), 'r'))
+
+        if 'train' in filename:
+            split = 'train'
+        elif 'val' in filename:
+            split = 'val'
+        elif 'test' in filename:
+            split = 'test'
+        else:
+            raise NotImplementedError
+
+        with open(filename.replace(filename.split('/')[-1], f'{split}_id.txt'), 'r') as f:
+            fnames = [line.split(' ')[0] for line in f.readlines()]
+
+        with open(filename) as f:
+            lines = f.readlines()
+
+        for idx, line in tqdm(enumerate(lines), desc='read'):
+            (sent, gt, _, _) = json.loads(line.strip())
+            s = sent.strip().split(self.delim)
+
+            if self.filter_length > 0 and len(s) > self.filter_length:
+                continue
+            if self.lowercase:
+                s = [w.lower() for w in s]
+            # if word2idx is not None:
+            #     s = [w if w in word2idx else '<unk>' for w in s]
+            example_ids.append(fnames[idx])
+            extra['file_order'].append(len(extra['file_order']))
+            sentences.append(s)
+            gts.append([tuple(i) for i in gt])
+
+        extra['example_ids'] = example_ids
+        extra['GT'] = gts
+        metadata = {}
+        #metadata['word2idx'] = word2idx
+
+        return {
+            "sentences": sentences,
+            "extra": extra,
+            "metadata": metadata
+            }
+
+class COCOASRReader(COCOReader):
+    def read(self, filename):
+        sentences = []
+        extra = dict()
+
+        example_ids = []
+        gts = []
+        vis_feats = []
+        pred2gold = []
+        # word2idx = None
+        # if os.path.exists(filename.replace(filename.split('/')[-1], 'coco.dict.json')):
+        #     word2idx = json.load(open(filename.replace(filename.split('/')[-1], 'coco.dict.json'), 'r'))
+
+        if 'train' in filename:
+            split = 'train'
+        elif 'val' in filename:
+            split = 'val'
+        elif 'test' in filename:
+            split = 'test'
+        else:
+            raise NotImplementedError
+
+        with open(filename) as f:
+            lines = f.readlines()
+
+        for idx, line in tqdm(enumerate(lines), desc='read'):
+            (fname, _, gt, sent, align) = json.loads(line.strip())  # _ is ground truth text sent, and sent is ASR transcript
+            s = sent.strip().split(self.delim)
+
+            if self.filter_length > 0 and len(s) > self.filter_length:
+                continue
+            if self.lowercase:
+                s = [w.lower() for w in s]
+            # if word2idx is not None:
+            #     s = [w if w in word2idx else '<unk>' for w in s]
+            example_ids.append(fname)
+            sentences.append(s)
+            gts.append([tuple(i) for i in gt])
+            pred2gold.append(align)
+
+        extra['example_ids'] = example_ids
+        extra['GT'] = gts
+        extra['align'] = pred2gold
+        metadata = {}
+        #metadata['word2idx'] = word2idx
+
+        return {
+            "sentences": sentences,
+            "extra": extra,
+            "metadata": metadata
+            }

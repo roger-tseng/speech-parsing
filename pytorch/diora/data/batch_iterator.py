@@ -1,5 +1,6 @@
 from diora.data.dataloader import FixedLengthBatchSampler, SimpleDataset
 from diora.blocks.negative_sampler import choose_negative_samples
+from diora.data.utils import boundaries_to_masks, read_textgrid
 
 import torch
 import numpy as np
@@ -33,6 +34,7 @@ def get_default_config():
         vocab=None,
         length_to_size=None,
         rank=None,
+        textgrid_folder=None,
     )
 
     return default_config
@@ -85,9 +87,10 @@ class Collate(object):
 
 class BatchIterator(object):
 
-    def __init__(self, sentences, extra={}, num_workers=0, **kwargs):
+    def __init__(self, sentences, extra={}, num_workers=0, modality='text', **kwargs):
         self.sentences = sentences
         self.num_workers = num_workers
+        self.modality = modality
         self.config = config = get_config(get_default_config(), **kwargs)
         self.extra = extra
         self.loader = None
@@ -109,7 +112,7 @@ class BatchIterator(object):
     def choose_negative_samples(self, negative_sampler, k_neg):
         return choose_negative_samples(negative_sampler, k_neg)
 
-    def get_iterator(self, **kwargs):
+    def get_iterator(self, hdf5, **kwargs):
         config = get_config(self.config.copy(), **kwargs)
 
         random_seed = config.get('random_seed')
@@ -124,6 +127,8 @@ class BatchIterator(object):
         negative_sampler = config.get('negative_sampler', None)
         num_workers = self.num_workers
         length_to_size = config.get('length_to_size', None)
+        if self.modality == 'speech':
+            textgrid_folder = config['textgrid_folder']
 
         collate_fn = Collate(self, rank, ngpus).collate_fn
 
@@ -147,9 +152,9 @@ class BatchIterator(object):
                 if negative_sampler is not None:
                     neg_samples = self.choose_negative_samples(negative_sampler, k_neg)
 
-                if cuda:
+                if cuda and self.modality != 'speech':
                     sentences = sentences.cuda()
-                if cuda and neg_samples is not None:
+                if cuda and self.modality != 'speech' and neg_samples is not None:
                     neg_samples = neg_samples.cuda()
 
                 batch_map = {}
@@ -161,6 +166,37 @@ class BatchIterator(object):
                 for k, v in self.extra.items():
                     batch_map[k] = batch[k]
 
+                if self.modality == 'speech':
+                    reps = []
+                    word_alignments = []
+                    for fname in batch_map['example_ids']:
+                        reps.append(hdf5[fname][:])
+                        _, words = read_textgrid(fname+'.TextGrid', 16000, textgrid_folder)
+                        word_alignments.append(words)
+                    batch_map['upstream_embeddings'] = torch.nn.utils.rnn.pad_sequence([torch.from_numpy(rep) for rep in reps], batch_first=True)
+
+                    if cuda:
+                        batch_map['upstream_embeddings'] = batch_map['upstream_embeddings'].to('cuda')
+                    emb_len = batch_map['upstream_embeddings'].shape[1]
+
+                    batch_map['word_masks'] = []
+
+                    for words in word_alignments:
+                        # if self.fixed_length_seg:
+                        #     l = length
+                        #     masks = []
+                        #     for i in range(l):
+                        #         mask = torch.zeros(emb_len)
+                        #         mask[i*(emb_len//l):(i+1)*(emb_len//l)] = 1
+                        #         masks.append(mask)
+                        #     word_mask = torch.stack(masks)
+                        word_mask = boundaries_to_masks(words, emb_len)
+                        batch_map['word_masks'].append(word_mask)
+                    batch_map['word_masks'] = torch.stack(batch_map['word_masks'])
+
+                    if cuda:
+                        batch_map['word_masks'] = batch_map['word_masks'].cuda()
+                    
                 yield batch_map
 
         return myiterator()

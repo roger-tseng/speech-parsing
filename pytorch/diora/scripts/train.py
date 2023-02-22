@@ -8,18 +8,25 @@ import uuid
 
 import torch
 import torch.nn as nn
+import numpy as np
+from tqdm import tqdm
+
+import h5py
+
+from diora.analysis.utils import *
+from diora.analysis.cky import ParsePredictor as CKY
 
 from diora.data.dataset import ConsolidateDatasets, ReconstructDataset, make_batch_iterator
 
 from diora.utils.path import package_path
 from diora.logging.configuration import configure_experiment, get_logger
 from diora.utils.flags import stringify_flags, init_with_flags_file, save_flags
-from diora.utils.checkpoint import save_experiment
+from diora.utils.checkpoint import update_best_model
 
 from diora.net.experiment_logger import ExperimentLogger
 
 
-data_types_choices = ('nli', 'conll_jsonl', 'txt', 'txt_id', 'synthetic', 'jsonl', 'ptb')
+data_types_choices = ('coco', 'coco_asr', 'nli', 'conll_jsonl', 'txt', 'txt_id', 'synthetic', 'jsonl', 'ptb')
 
 
 def count_params(net):
@@ -36,9 +43,16 @@ def build_net(options, embeddings, batch_iterator=None):
 
     return trainer
 
-
-def generate_seeds(n, seed=11):
+def seed_all(seed):
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+def generate_seeds(n):
     seeds = [random.randint(0, 2**16) for _ in range(n)]
     return seeds
 
@@ -49,10 +63,16 @@ def run_train(options, train_iterator, trainer, validation_iterator):
 
     logger.info('Running train.')
 
-    seeds = generate_seeds(options.max_epoch, options.seed)
+    seeds = generate_seeds(options.max_epoch)
+
+    word2idx = train_iterator.word2idx
+    idx2word = {v: k for k, v in word2idx.items()}
 
     step = 0
-
+    best_f1 = 0.
+    best_unsup_f1 = 0.
+    best_loss = 1000.
+    # corpus_f1, loss_name, loss = run_eval(options, trainer, validation_iterator)
     for epoch, seed in zip(range(options.max_epoch), seeds):
         # --- Train--- #
 
@@ -61,7 +81,7 @@ def run_train(options, train_iterator, trainer, validation_iterator):
         logger.info('epoch={} seed={}'.format(epoch, seed))
 
         def myiterator():
-            it = train_iterator.get_iterator(random_seed=seed)
+            it = train_iterator.get_iterator(options.train_hdf5, random_seed=seed)
 
             count = 0
 
@@ -89,24 +109,154 @@ def run_train(options, train_iterator, trainer, validation_iterator):
             if not options.multigpu or options.local_rank == 0:
                 if step % options.save_latest == 0 and step >= options.save_after:
                     logger.info('Saving model (periodic).')
-                    trainer.save_model(os.path.join(options.experiment_path, 'model_periodic.pt'))
-                    save_experiment(os.path.join(options.experiment_path, 'experiment_periodic.json'), step)
+                    trainer.save_model(os.path.join(options.experiment_path, 'model_periodic.pt'), save_emb=(options.emb == 'none'))
 
                 if step % options.save_distinct == 0 and step >= options.save_after:
                     logger.info('Saving model (distinct).')
-                    trainer.save_model(os.path.join(options.experiment_path, 'model.step_{}.pt'.format(step)))
-                    save_experiment(os.path.join(options.experiment_path, 'experiment.step_{}.json'.format(step)), step)
+                    trainer.save_model(os.path.join(options.experiment_path, 'model.step_{}.pt'.format(step)), save_emb=(options.emb == 'none'))
+                    
+                    if options.modality == 'speech':
+                        corpus_f1, _, loss = run_eval(options, trainer, validation_iterator)
+                        if corpus_f1 > best_f1:
+                            best_f1 = corpus_f1
+                            update_best_model(
+                                os.path.join(options.experiment_path, 'model.step_{}.pt'.format(step)),
+                                os.path.join(options.experiment_path, 'model.best.pt')
+                            )
 
+                        if loss < best_loss:
+                            best_loss = loss
+                            best_unsup_f1 = corpus_f1
+                            update_best_model(
+                                os.path.join(options.experiment_path, 'model.step_{}.pt'.format(step)),
+                                os.path.join(options.experiment_path, 'model.unsup_best.pt')
+                            )
+                        logger.info('Periodic model corpus_f1 with trivial: {}, loss: {}, best_trivial_corpus_f1: {}, best_trivial_unsup_corpus_f1: {}, best_loss: {}.'.format(corpus_f1, loss, best_f1, best_unsup_f1, best_loss))
+                        #logger.info('Periodic model corpus_f1: {}, best_corpus_f1: {}, sent_f1: {}.'.format(corpus_f1, best_f1, sent_f1))
             del result
 
+            if options.max_step is not None and step >= options.max_step:
+                logger.info('Max-Step={} Quitting.'.format(options.max_step))
+                if options.train_hdf5 is not None:
+                    options.train_hdf5.close()
+                if options.valid_hdf5 is not None:
+                    options.valid_hdf5.close()
+                sys.exit()
+            
             step += 1
 
         experiment_logger.log_epoch(epoch, step)
 
+        # Epoch Eval and Checkpoints -- #
+        if not options.multigpu or options.local_rank == 0:
+            trainer.save_model(os.path.join(options.experiment_path, 'model.epoch_{}.pt'.format(epoch)), save_emb=(options.emb == 'none'))
+
+            corpus_f1, _, loss = run_eval(options, trainer, validation_iterator)
+            if corpus_f1 > best_f1:
+                best_f1 = corpus_f1
+                update_best_model(
+                    os.path.join(options.experiment_path, 'model.epoch_{}.pt'.format(epoch)),
+                    os.path.join(options.experiment_path, 'model.best.pt')
+                )
+            if loss < best_loss:
+                best_loss = loss
+                best_unsup_f1 = corpus_f1
+                update_best_model(
+                    os.path.join(options.experiment_path, 'model.epoch_{}.pt'.format(epoch)),
+                    os.path.join(options.experiment_path, 'model.unsup_best.pt')
+                )
+            logger.info('Saving model epoch {},  corpus_f1 with trivial: {}, loss: {}, best_trivial_corpus_f1: {}, best_trivial_unsup_corpus_f1: {}, best_loss: {}.'.format(epoch, corpus_f1, loss, best_f1, best_unsup_f1, best_loss))
+        
         if options.max_step is not None and step >= options.max_step:
             logger.info('Max-Step={} Quitting.'.format(options.max_step))
+            if options.train_hdf5 is not None:
+                options.train_hdf5.close()
+            if options.valid_hdf5 is not None:
+                options.valid_hdf5.close()
             sys.exit()
 
+    if options.train_hdf5 is not None:
+        options.train_hdf5.close()
+    if options.valid_hdf5 is not None:
+        options.valid_hdf5.close()
+
+def run_eval(options, trainer, validation_iterator):
+    logger = get_logger()
+    sparseval = options.validation_data_type == 'coco_asr'
+    # Eval mode.
+    trainer.net.eval()
+    if options.multigpu:
+        diora = trainer.net.module.diora
+    else:
+        diora = trainer.net.diora
+    # diora.outside = False s
+
+    override_init_with_batch(diora)
+    override_inside_hook(diora)
+    parse_predictor = CKY(net=diora)
+
+    batches = validation_iterator.get_iterator(options.valid_hdf5, random_seed=options.seed)
+
+    logger.info('####### Beginning Eval #######')
+
+    corpus_f1 = [0., 0., 0.]
+    sent_f1 = []
+    with torch.no_grad():
+        for i, batch_map in tqdm(enumerate(batches)):
+            sentences = batch_map['sentences']
+            length = sentences.shape[1]
+
+            # Skip very short sentences.
+            if length <= 2:
+                continue
+
+            result = trainer.step(batch_map, train=False, compute_loss=True)
+            for k, v in result.items():
+                if 'loss' in k:
+                    break
+
+
+            # Parsing eval
+            trees = parse_predictor.parse_batch(batch_map)
+
+            for bid, tr in enumerate(trees):
+                gold_spans = set(batch_map['GT'][bid])
+                pred_actions = get_actions(str(tr))
+                pred_spans = set(get_spans(pred_actions))
+                if sparseval:
+                    pred2gold = {k: v for k, v in batch_map['align'][bid]}
+                    pred_spans = set((pred2gold[l], pred2gold[r]) for l, r in pred_spans if (l in pred2gold and r in pred2gold))
+                tp, fp, fn = get_stats(pred_spans, gold_spans)
+                corpus_f1[0] += tp
+                corpus_f1[1] += fp
+                corpus_f1[2] += fn
+
+                # # SentF1
+                # overlap = pred_spans.intersection(gold_spans)
+                # prec = float(len(overlap)) / (len(pred_spans) + 1e-8)
+                # reca = float(len(overlap)) / (len(gold_spans) + 1e-8)
+                # if len(gold_spans) == 0:
+                #     reca = 1.
+                #     if len(pred_spans) == 0:
+                #         prec = 1.
+                # f1 = 2 * prec * reca / (prec + reca + 1e-8)
+                # sent_f1.append(f1)
+
+    tp, fp, fn = corpus_f1
+    prec = tp / (tp + fp)
+    recall = tp / (tp + fn)
+    corpus_f1 = 2 * prec * recall / (prec + recall) if prec + recall > 0 else 0.
+    # n_sent = len(sent_f1)
+    # prec_with_trivial = (tp + n_sent) / (tp + n_sent + fp)
+    # recall_with_trivial = (tp + n_sent) / (tp + n_sent + fn)
+    # corpus_f1_with_trivial = 2 * prec_with_trivial * recall_with_trivial / (prec_with_trivial + recall_with_trivial) if prec_with_trivial + recall_with_trivial > 0 else 0.
+    # sent_f1 = np.mean(np.array(sent_f1))
+    logger.info('corpus_f1:{} \t {}:{}'.format(corpus_f1, k, v))
+
+    # Train mode.
+    diora.outside = True
+    trainer.net.train()
+    return corpus_f1, k, v
 
 def get_train_dataset(options):
     return ReconstructDataset().initialize(options, text_path=options.train_path,
@@ -117,7 +267,8 @@ def get_train_dataset(options):
 def get_train_iterator(options, dataset):
     return make_batch_iterator(options, dataset, shuffle=True,
             include_partial=False, filter_length=options.train_filter_length,
-            batch_size=options.batch_size, length_to_size=options.length_to_size)
+            batch_size=options.batch_size, length_to_size=options.length_to_size,
+            is_train_set=True)
 
 
 def get_validation_dataset(options):
@@ -129,7 +280,8 @@ def get_validation_dataset(options):
 def get_validation_iterator(options, dataset):
     return make_batch_iterator(options, dataset, shuffle=False,
             include_partial=True, filter_length=options.validation_filter_length,
-            batch_size=options.validation_batch_size, length_to_size=options.length_to_size)
+            batch_size=options.validation_batch_size, length_to_size=options.length_to_size,
+            is_train_set=False)
 
 
 def get_train_and_validation(options):
@@ -137,12 +289,24 @@ def get_train_and_validation(options):
     validation_dataset = get_validation_dataset(options)
 
     # Modifies datasets. Unifying word mappings, embeddings, etc.
-    ConsolidateDatasets([train_dataset, validation_dataset]).run()
+    if options.emb != 'none':
+        ConsolidateDatasets([train_dataset, validation_dataset]).run()
 
     return train_dataset, validation_dataset
 
 
 def run(options):
+
+    seed_all(options.seed)
+
+    if options.train_hdf5 is not None and options.valid_hdf5 is not None and options.train_hdf5 == options.valid_hdf5:
+        options.train_hdf5 = options.valid_hdf5 = h5py.File(options.train_hdf5, 'r')
+    else:
+        if options.train_hdf5 is not None:
+            options.train_hdf5 = h5py.File(options.train_hdf5, 'r')
+        if options.valid_hdf5 is not None:
+            options.valid_hdf5 = h5py.File(options.valid_hdf5, 'r')
+
     logger = get_logger()
     experiment_logger = ExperimentLogger()
 
@@ -159,7 +323,7 @@ def run(options):
 
     if options.save_init:
         logger.info('Saving model (init).')
-        trainer.save_model(os.path.join(options.experiment_path, 'model_init.pt'))
+        trainer.save_model(os.path.join(options.experiment_path, 'model_init.pt'), save_emb=(options.emb == 'none'))
 
     run_train(options, train_iterator, trainer, validation_iterator)
 
@@ -208,16 +372,8 @@ def argument_parser():
     parser.add_argument('--train_path', default=os.path.expanduser('~/data/snli_1.0/snli_1.0_train.jsonl'), type=str)
     parser.add_argument('--validation_path', default=os.path.expanduser('~/data/snli_1.0/snli_1.0_dev.jsonl'), type=str)
     parser.add_argument('--embeddings_path', default=os.path.expanduser('~/data/glove/glove.6B.300d.txt'), type=str)
-
-    # Data (synthetic).
-    parser.add_argument('--synthetic-nexamples', default=1000, type=int)
-    parser.add_argument('--synthetic-vocabsize', default=1000, type=int)
-    parser.add_argument('--synthetic-embeddingsize', default=1024, type=int)
-    parser.add_argument('--synthetic-minlen', default=20, type=int)
-    parser.add_argument('--synthetic-maxlen', default=21, type=int)
-    parser.add_argument('--synthetic-seed', default=11, type=int)
-    parser.add_argument('--synthetic-length', default=None, type=int)
-    parser.add_argument('--use-synthetic-embeddings', action='store_true')
+    parser.add_argument('--dict', default=None, type=str, 
+                        help="Path of precomputed dictionary. If not specified, is computed on the fly, and no OOVs will exist.")
 
     # Data (preprocessing).
     parser.add_argument('--uppercase', action='store_true')
@@ -236,7 +392,17 @@ def argument_parser():
     parser.add_argument('--reconstruct_mode', default='margin', choices=('margin', 'softmax'))
 
     # Model (Embeddings).
-    parser.add_argument('--emb', default='w2v', choices=('w2v', 'elmo', 'both'))
+    parser.add_argument('--emb', default='w2v', choices=('w2v', 'elmo', 'both', 'none'))
+    parser.add_argument('--emb_dim', type=int, help='sets dimensions of word embeddings when emb is none')
+
+    # Model (Speech).
+    parser.add_argument('--modality', default='text', choices=('speech', 'text'))
+    # parser.add_argument('--upstream_model', default='hubert')
+    # parser.add_argument('--upstream_layer', default=6, type=int)
+    parser.add_argument('--train_textgrid_folder', type=str)
+    parser.add_argument('--valid_textgrid_folder', type=str)
+    parser.add_argument('--train_hdf5', type=str)
+    parser.add_argument('--valid_hdf5', type=str)
 
     # Model (Negative Sampler).
     parser.add_argument('--margin', default=1, type=float)

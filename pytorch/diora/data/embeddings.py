@@ -155,6 +155,8 @@ class EmbeddingsReader(object):
             out = self.get_emb_elmo(options, embeddings_path, word2idx)
         elif options.emb == 'both':
             out = self.get_emb_both(options, embeddings_path, word2idx)
+        elif options.emb == 'none':
+            out = (torch.nn.Embedding(len(word2idx), options.emb_dim), word2idx)
         return out
 
 

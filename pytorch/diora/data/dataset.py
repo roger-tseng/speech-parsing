@@ -1,17 +1,18 @@
 from collections import deque
+import json
 
 import torch
 import numpy as np
 
 from tqdm import tqdm
 
-from diora.data.reading import NLIReader, PlainTextReader, ConllReader, JSONLReader, PTBReader
+from diora.data.reading import COCOReader, COCOASRReader, NLIReader, PlainTextReader, ConllReader, JSONLReader, PTBReader
 from diora.data.batch_iterator import BatchIterator
 from diora.data.embeddings import EmbeddingsReader, UNK_TOKEN
 from diora.data.preprocessing import indexify, build_text_vocab
 from diora.data.preprocessing import synthesize_training_data
 from diora.logging.configuration import get_logger
-from diora.blocks.negative_sampler import NegativeSampler, calculate_freq_dist
+from diora.blocks.negative_sampler import NegativeSampler, NegativeSamplerByFile, calculate_freq_dist
 
 
 class ConsolidateDatasets(object):
@@ -81,8 +82,13 @@ class ReaderManager(object):
         metadata = reader_result.get('metadata', {})
         logger.info('len(sentences)={}'.format(len(sentences)))
 
-        word2idx = build_text_vocab(sentences)
-        logger.info('len(vocab)={}'.format(len(word2idx)))
+        if options.dict is not None:
+            logger.info(f'Using predefined word2idx dictionary at {options.dict}')
+            word2idx = json.load(open(options.dict, 'r'))
+            sentences = [[w if w in word2idx else '<unk>' for w in s] for s in sentences]
+        else:
+            logger.info(f'Building word2idx dictionary on the fly...')
+            word2idx = build_text_vocab(sentences)
 
         if 'embeddings' in metadata:
             logger.info('Using embeddings from metadata.')
@@ -111,6 +117,10 @@ class ReconstructDataset(object):
     def initialize(self, options, text_path=None, embeddings_path=None, filter_length=0, data_type=None):
         if data_type == 'nli':
             reader = NLIReader.build(lowercase=options.lowercase, filter_length=filter_length)
+        elif data_type == 'coco':
+            reader = COCOReader(lowercase=options.lowercase, filter_length=filter_length)
+        elif data_type == 'coco_asr':
+            reader = COCOASRReader(lowercase=options.lowercase, filter_length=filter_length)
         elif data_type == 'conll_jsonl':
             reader = ConllReader(lowercase=options.lowercase, filter_length=filter_length)
         elif data_type == 'ptb':
@@ -135,7 +145,7 @@ class ReconstructDataset(object):
 
 
 def make_batch_iterator(options, dset, shuffle=True, include_partial=False, filter_length=0,
-                        batch_size=None, length_to_size=None):
+                        batch_size=None, length_to_size=None, is_train_set=False):
     sentences = dset['sentences']
     word2idx = dset['word2idx']
     extra = dset['extra']
@@ -153,12 +163,19 @@ def make_batch_iterator(options, dset, shuffle=True, include_partial=False, filt
     negative_sampler = None
     if options.reconstruct_mode in ('margin', 'softmax'):
         freq_dist = calculate_freq_dist(sentences, vocab_size)
-        negative_sampler = NegativeSampler(freq_dist=freq_dist, dist_power=options.freq_dist_power)
+        if options.modality == 'speech':
+            if options.train_hdf5 is not None and options.valid_hdf5 is not None:
+                negative_sampler = NegativeSamplerByFile(extra['example_ids'], options, is_train_set)
+            else:
+                raise NotImplementedError # Extracting SSL features on the fly is much slower
+        else:
+            negative_sampler = NegativeSampler(freq_dist=freq_dist, dist_power=options.freq_dist_power)
     vocab_lst = [w for w, _ in sorted(word2idx.items(), key=lambda x: x[1])]
 
     batch_iterator = BatchIterator(
         sentences,
         extra=extra,
+        modality=options.modality,
         shuffle=shuffle,
         include_partial=include_partial,
         filter_length=filter_length,
@@ -173,6 +190,7 @@ def make_batch_iterator(options, dset, shuffle=True, include_partial=False, filt
         options_path=options.elmo_options_path,
         weights_path=options.elmo_weights_path,
         length_to_size=length_to_size,
+        textgrid_folder=options.train_textgrid_folder if is_train_set else options.valid_textgrid_folder,
         )
 
     # DIRTY HACK: Makes it easier to print examples later. Should really wrap this within the class.

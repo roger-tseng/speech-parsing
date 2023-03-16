@@ -2,6 +2,7 @@ import collections
 import json
 import os
 import types
+import h5py
 
 import torch
 
@@ -14,6 +15,7 @@ from train import build_net
 from diora.logging.configuration import get_logger
 
 from diora.analysis.cky import ParsePredictor as CKY
+from diora.scripts.train import seed_all
 
 
 punctuation_words = set([x.lower() for x in ['.', ',', ':', '-LRB-', '-RRB-', '\'\'',
@@ -168,6 +170,11 @@ class FileWriter(object):
 
 
 def run(options):
+
+    seed_all(options.seed)
+    if options.valid_hdf5 is not None:
+        options.valid_hdf5 = h5py.File(options.valid_hdf5, 'r')
+
     logger = get_logger()
 
     validation_dataset = get_validation_dataset(options)
@@ -195,9 +202,9 @@ def run(options):
     trainer.net.eval()
 
     ## Parse predictor.
-    parse_predictor = CKY(net=diora, word2idx=word2idx)
+    parse_predictor = CKY(net=diora)
 
-    batches = validation_iterator.get_iterator(random_seed=options.seed)
+    batches = validation_iterator.get_iterator(options.valid_hdf5, random_seed=options.seed)
 
     output_file = os.path.abspath(os.path.join(options.experiment_path, 'parse.jsonl'))
 

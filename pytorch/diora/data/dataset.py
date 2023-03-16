@@ -164,7 +164,7 @@ def make_batch_iterator(options, dset, shuffle=True, include_partial=False, filt
     if options.reconstruct_mode in ('margin', 'softmax'):
         freq_dist = calculate_freq_dist(sentences, vocab_size)
         if options.modality == 'speech':
-            if options.train_hdf5 is not None and options.valid_hdf5 is not None:
+            if options.valid_hdf5 is not None:
                 negative_sampler = NegativeSamplerByFile(extra['example_ids'], options, is_train_set)
             else:
                 raise NotImplementedError # Extracting SSL features on the fly is much slower

@@ -1,4 +1,0 @@
-allennlp
-torch
-torchvision
-tqdm

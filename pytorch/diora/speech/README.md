@@ -36,7 +36,7 @@ cd ..
 
 1. Download [SpokenCOCO](https://groups.csail.mit.edu/sls/downloads/placesaudio/) 
 
-2. Download train/val/test split and word segmentation files we used [here](https://gntuedutw-my.sharepoint.com/:u:/g/personal/b07901163_g_ntu_edu_tw/EYflIwxr609IqYRzUqRyJTUBSDWCxGBzL5wGt-JWdal-dw?e=RWge46). 
+2. Download train/val/test split and word segmentation files we used [here](https://gntuedutw-my.sharepoint.com/:u:/g/personal/b07901163_g_ntu_edu_tw/ES7fjV4G7qBCpWQs6en-knsBC2VpWWRKi9qUcFJw18N5Fw). 
 Place files under `data/SpokenCOCO`.
 Initial data structure should look like:
 ```
